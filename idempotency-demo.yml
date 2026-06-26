@@ -1,0 +1,40 @@
+---
+# Idempotency demo — run this from AAP as a Job Template.
+# Watch each task's status and the PLAY RECAP:
+#   - a task that DOES work reports "changed"
+#   - the identical task right after reports "ok" (nothing left to do)
+- name: Idempotency demo
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    - name: Create a working directory  (expect CHANGED)
+      ansible.builtin.file:
+        path: /tmp/aap-idempotency-demo
+        state: directory
+
+    - name: Ensure that same directory exists  (expect OK — already done)
+      ansible.builtin.file:
+        path: /tmp/aap-idempotency-demo
+        state: directory
+
+    - name: Write a managed config file  (expect CHANGED)
+      ansible.builtin.copy:
+        dest: /tmp/aap-idempotency-demo/managed.conf
+        content: |
+          # This file is managed by Ansible
+          environment = lab
+          managed = true
+
+    - name: Ensure that file has the exact same content  (expect OK — already correct)
+      ansible.builtin.copy:
+        dest: /tmp/aap-idempotency-demo/managed.conf
+        content: |
+          # This file is managed by Ansible
+          environment = lab
+          managed = true
+
+    - name: Show the result
+      ansible.builtin.debug:
+        msg: "Done. The RECAP should read ok=5 changed=2 — two real changes, the rest already in the desired state."
