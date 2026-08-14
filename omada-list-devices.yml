@@ -1,9 +1,7 @@
 ---
-# Omada Open API — READ-ONLY discovery: authenticate, list the site, list APs.
-# Credentials are injected by AAP as extra_vars from the "Omada Open API" credential:
+# Omada Open API — READ-ONLY: authenticate, list the site, list + report APs.
+# Credentials are injected by AAP from the "Omada Open API" credential:
 #   omada_base_url, omada_id, omada_client_id, omada_client_secret
-# This run is intentionally verbose so we can see the real API response shape.
-# (AAP still masks the Client Secret automatically in the job output.)
 - name: Omada — list access points (read-only)
   hosts: localhost
   connection: local
@@ -37,15 +35,16 @@
         return_content: true
       register: omada_token_resp
 
+    - name: Fail clearly if authentication returned an API error
+      ansible.builtin.assert:
+        that: omada_token_resp.json.errorCode == 0
+        fail_msg: "Auth failed — errorCode={{ omada_token_resp.json.errorCode }}: {{ omada_token_resp.json.msg | default('') }}"
+
     - name: Save the access token
       ansible.builtin.set_fact:
         omada_token: "{{ omada_token_resp.json.result.accessToken }}"
 
-    - name: Report auth result (0 = success)
-      ansible.builtin.debug:
-        msg: "Auth errorCode={{ omada_token_resp.json.errorCode | default('?') }}"
-
-    - name: List sites
+    - name: List sites (paginated)
       ansible.builtin.uri:
         url: "{{ omada_base_url }}/openapi/v1/{{ omada_id }}/sites?page=1&pageSize=100"
         method: GET
@@ -56,31 +55,34 @@
         return_content: true
       register: omada_sites_resp
 
-    - name: Show the raw SITES response (reveals the real field names)
+    - name: Resolve the site id for "{{ omada_site_name }}"
+      ansible.builtin.set_fact:
+        omada_site_id: "{{ omada_sites_resp.json.result.data | selectattr('name', 'equalto', omada_site_name) | map(attribute='siteId') | first }}"
+
+    - name: List devices in the site (page + pageSize are REQUIRED)
+      ansible.builtin.uri:
+        url: "{{ omada_base_url }}/openapi/v1/{{ omada_id }}/sites/{{ omada_site_id }}/devices?page=1&pageSize=100"
+        method: GET
+        headers:
+          Authorization: "AccessToken={{ omada_token }}"
+        validate_certs: "{{ omada_validate_certs }}"
+        timeout: 20
+        return_content: true
+      register: omada_devices_resp
+
+    - name: Show the raw DEVICES response (confirms the real field names)
       ansible.builtin.debug:
-        var: omada_sites_resp.json
+        var: omada_devices_resp.json
 
-    - name: List the access points for the site
-      block:
-        - name: Resolve the site id for "{{ omada_site_name }}"
-          ansible.builtin.set_fact:
-            omada_site_id: "{{ omada_sites_resp.json.result.data | selectattr('name', 'equalto', omada_site_name) | map(attribute='siteId') | first }}"
+    - name: Validate the API's own errorCode (HTTP 200 is not enough!)
+      ansible.builtin.assert:
+        that: omada_devices_resp.json.errorCode == 0
+        fail_msg: "Omada API error {{ omada_devices_resp.json.errorCode }}: {{ omada_devices_resp.json.msg }}"
+        success_msg: "Devices retrieved."
 
-        - name: List devices in the site
-          ansible.builtin.uri:
-            url: "{{ omada_base_url }}/openapi/v1/{{ omada_id }}/sites/{{ omada_site_id }}/devices"
-            method: GET
-            headers:
-              Authorization: "AccessToken={{ omada_token }}"
-            validate_certs: "{{ omada_validate_certs }}"
-            timeout: 20
-            return_content: true
-          register: omada_devices_resp
-
-        - name: Show the raw DEVICES response (your APs)
-          ansible.builtin.debug:
-            var: omada_devices_resp.json
-      rescue:
-        - name: Device step needs a small tweak
-          ansible.builtin.debug:
-            msg: "Auth + sites worked. Share the SITES output above and I'll adjust the device path/field names."
+    - name: Per-AP summary (fields default to '?' if named differently)
+      ansible.builtin.debug:
+        msg: "{{ item.name | default('?') }} | model={{ item.model | default('?') }} | ip={{ item.ip | default('?') }} | fw={{ item.version | default(item.firmwareVersion) | default('?') }} | status={{ item.status | default('?') }} | needUpgrade={{ item.needUpgrade | default('?') }}"
+      loop: "{{ omada_devices_resp.json.result.data | default([]) }}"
+      loop_control:
+        label: "{{ item.name | default('?') }}"
