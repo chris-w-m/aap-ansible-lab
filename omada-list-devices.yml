@@ -1,0 +1,86 @@
+---
+# Omada Open API — READ-ONLY discovery: authenticate, list the site, list APs.
+# Credentials are injected by AAP as extra_vars from the "Omada Open API" credential:
+#   omada_base_url, omada_id, omada_client_id, omada_client_secret
+# This run is intentionally verbose so we can see the real API response shape.
+# (AAP still masks the Client Secret automatically in the job output.)
+- name: Omada — list access points (read-only)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    omada_validate_certs: false      # OC200 uses a self-signed cert (lab setting)
+    omada_site_name: "Shadybank"
+
+  tasks:
+    - name: Preflight — ensure the Omada credential is attached
+      ansible.builtin.assert:
+        that:
+          - omada_base_url is defined
+          - omada_id is defined
+          - omada_client_id is defined
+          - omada_client_secret is defined
+        fail_msg: "Omada API variables are missing — attach the 'Omada Open API' credential to this Job Template."
+
+    - name: Request an Open API access token (client-credentials grant)
+      ansible.builtin.uri:
+        url: "{{ omada_base_url }}/openapi/authorize/token?grant_type=client_credentials"
+        method: POST
+        body_format: json
+        body:
+          omadacId: "{{ omada_id }}"
+          client_id: "{{ omada_client_id }}"
+          client_secret: "{{ omada_client_secret }}"
+        validate_certs: "{{ omada_validate_certs }}"
+        timeout: 20
+        return_content: true
+      register: omada_token_resp
+
+    - name: Save the access token
+      ansible.builtin.set_fact:
+        omada_token: "{{ omada_token_resp.json.result.accessToken }}"
+
+    - name: Report auth result (0 = success)
+      ansible.builtin.debug:
+        msg: "Auth errorCode={{ omada_token_resp.json.errorCode | default('?') }}"
+
+    - name: List sites
+      ansible.builtin.uri:
+        url: "{{ omada_base_url }}/openapi/v1/{{ omada_id }}/sites?page=1&pageSize=100"
+        method: GET
+        headers:
+          Authorization: "AccessToken={{ omada_token }}"
+        validate_certs: "{{ omada_validate_certs }}"
+        timeout: 20
+        return_content: true
+      register: omada_sites_resp
+
+    - name: Show the raw SITES response (reveals the real field names)
+      ansible.builtin.debug:
+        var: omada_sites_resp.json
+
+    - name: List the access points for the site
+      block:
+        - name: Resolve the site id for "{{ omada_site_name }}"
+          ansible.builtin.set_fact:
+            omada_site_id: "{{ omada_sites_resp.json.result.data | selectattr('name', 'equalto', omada_site_name) | map(attribute='siteId') | first }}"
+
+        - name: List devices in the site
+          ansible.builtin.uri:
+            url: "{{ omada_base_url }}/openapi/v1/{{ omada_id }}/sites/{{ omada_site_id }}/devices"
+            method: GET
+            headers:
+              Authorization: "AccessToken={{ omada_token }}"
+            validate_certs: "{{ omada_validate_certs }}"
+            timeout: 20
+            return_content: true
+          register: omada_devices_resp
+
+        - name: Show the raw DEVICES response (your APs)
+          ansible.builtin.debug:
+            var: omada_devices_resp.json
+      rescue:
+        - name: Device step needs a small tweak
+          ansible.builtin.debug:
+            msg: "Auth + sites worked. Share the SITES output above and I'll adjust the device path/field names."
