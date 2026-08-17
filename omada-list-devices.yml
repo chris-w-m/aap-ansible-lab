@@ -90,4 +90,21 @@
       register: omada_dev_detail
       failed_when: false          # discovery: never hard-fail, we want to SEE the response
       loop: "{{ omada_devices_resp.json.result.data }}"
-      lo
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Dump the FIRST device's raw detail (reveals firmware fields)
+      ansible.builtin.debug:
+        var: omada_dev_detail.results[0].json
+
+    - name: Best-effort firmware status per device (fields default if named differently)
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.item.name }}
+          | fw={{ item.json.result.firmwareVersion | default('?') }}
+          | needUpgrade={{ item.json.result.needUpgrade | default('MISSING') }}
+          | httpStatus={{ item.status | default('?') }}
+          | apiErr={{ item.json.errorCode | default('?') }}
+      loop: "{{ omada_dev_detail.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
