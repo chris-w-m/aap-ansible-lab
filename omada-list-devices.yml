@@ -1,8 +1,9 @@
 ---
-# Omada Open API — READ-ONLY: list APs + probe per-device firmware detail.
-# Credentials injected by AAP from the "Omada Open API" credential:
-#   omada_base_url, omada_id, omada_client_id, omada_client_secret
-- name: Omada — list access points and probe firmware status (read-only)
+# Omada Open API — READ-ONLY: list APs + per-device firmware availability.
+# Endpoint confirmed from a working reference implementation:
+#   GET /openapi/v1/{omada_id}/sites/{site_id}/devices/{mac}/latest-firmware-info
+# Credentials injected by AAP from the "Omada Open API" credential.
+- name: Omada — list APs and check firmware availability (read-only)
   hosts: localhost
   connection: local
   gather_facts: false
@@ -70,41 +71,27 @@
         return_content: true
       register: omada_devices_resp
 
-    - name: Inventory summary (from the list endpoint)
-      ansible.builtin.debug:
-        msg: "{{ item.name }} | {{ item.model }} | {{ item.ip }} | fw={{ item.firmwareVersion }} | mac={{ item.mac }}"
-      loop: "{{ omada_devices_resp.json.result.data }}"
-      loop_control:
-        label: "{{ item.name }}"
-
-    # ---- Firmware probe: fetch each device's DETAIL record ----
-    - name: Get per-device DETAIL (where needUpgrade likely lives)
+    - name: Get latest firmware info per device
       ansible.builtin.uri:
-        url: "{{ omada_base_url }}/openapi/v1/{{ omada_id }}/sites/{{ omada_site_id }}/devices/{{ item.mac }}"
+        url: "{{ omada_base_url }}/openapi/v1/{{ omada_id }}/sites/{{ omada_site_id }}/devices/{{ item.mac }}/latest-firmware-info"
         method: GET
         headers:
           Authorization: "AccessToken={{ omada_token }}"
         validate_certs: "{{ omada_validate_certs }}"
         timeout: 20
         return_content: true
-      register: omada_dev_detail
-      failed_when: false          # discovery: never hard-fail, we want to SEE the response
+      register: omada_fw
+      failed_when: false
       loop: "{{ omada_devices_resp.json.result.data }}"
       loop_control:
         label: "{{ item.name }}"
 
-    - name: Dump the FIRST device's raw detail (reveals firmware fields)
-      ansible.builtin.debug:
-        var: omada_dev_detail.results[0].json
-
-    - name: Best-effort firmware status per device (fields default if named differently)
+    - name: Show device + raw firmware-info (reveals the real fields)
       ansible.builtin.debug:
         msg: >-
-          {{ item.item.name }}
-          | fw={{ item.json.result.firmwareVersion | default('?') }}
-          | needUpgrade={{ item.json.result.needUpgrade | default('MISSING') }}
-          | httpStatus={{ item.status | default('?') }}
+          {{ item.item.name }} ({{ item.item.model }}) current={{ item.item.firmwareVersion }}
           | apiErr={{ item.json.errorCode | default('?') }}
-      loop: "{{ omada_dev_detail.results }}"
+          | firmwareInfo={{ item.json.result | default('n/a') }}
+      loop: "{{ omada_fw.results }}"
       loop_control:
         label: "{{ item.item.name }}"
