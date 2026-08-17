@@ -1,14 +1,14 @@
 ---
-# Omada Open API — READ-ONLY: authenticate, list the site, list + report APs.
-# Credentials are injected by AAP from the "Omada Open API" credential:
+# Omada Open API — READ-ONLY: list APs + probe per-device firmware detail.
+# Credentials injected by AAP from the "Omada Open API" credential:
 #   omada_base_url, omada_id, omada_client_id, omada_client_secret
-- name: Omada — list access points (read-only)
+- name: Omada — list access points and probe firmware status (read-only)
   hosts: localhost
   connection: local
   gather_facts: false
 
   vars:
-    omada_validate_certs: false      # OC200 uses a self-signed cert (lab setting)
+    omada_validate_certs: false      # OC200 self-signed cert (lab setting)
     omada_site_name: "Shadybank"
 
   tasks:
@@ -19,7 +19,7 @@
           - omada_id is defined
           - omada_client_id is defined
           - omada_client_secret is defined
-        fail_msg: "Omada API variables are missing — attach the 'Omada Open API' credential to this Job Template."
+        fail_msg: "Omada API variables missing — attach the 'Omada Open API' credential to this Job Template."
 
     - name: Request an Open API access token (client-credentials grant)
       ansible.builtin.uri:
@@ -59,7 +59,7 @@
       ansible.builtin.set_fact:
         omada_site_id: "{{ omada_sites_resp.json.result.data | selectattr('name', 'equalto', omada_site_name) | map(attribute='siteId') | first }}"
 
-    - name: List devices in the site (page + pageSize are REQUIRED)
+    - name: List devices in the site (page + pageSize required)
       ansible.builtin.uri:
         url: "{{ omada_base_url }}/openapi/v1/{{ omada_id }}/sites/{{ omada_site_id }}/devices?page=1&pageSize=100"
         method: GET
@@ -70,19 +70,24 @@
         return_content: true
       register: omada_devices_resp
 
-    - name: Show the raw DEVICES response (confirms the real field names)
+    - name: Inventory summary (from the list endpoint)
       ansible.builtin.debug:
-        var: omada_devices_resp.json
-
-    - name: Validate the API's own errorCode (HTTP 200 is not enough!)
-      ansible.builtin.assert:
-        that: omada_devices_resp.json.errorCode == 0
-        fail_msg: "Omada API error {{ omada_devices_resp.json.errorCode }}: {{ omada_devices_resp.json.msg }}"
-        success_msg: "Devices retrieved."
-
-    - name: Per-AP summary (fields default to '?' if named differently)
-      ansible.builtin.debug:
-        msg: "{{ item.name | default('?') }} | model={{ item.model | default('?') }} | ip={{ item.ip | default('?') }} | fw={{ item.version | default(item.firmwareVersion) | default('?') }} | status={{ item.status | default('?') }} | needUpgrade={{ item.needUpgrade | default('?') }}"
-      loop: "{{ omada_devices_resp.json.result.data | default([]) }}"
+        msg: "{{ item.name }} | {{ item.model }} | {{ item.ip }} | fw={{ item.firmwareVersion }} | mac={{ item.mac }}"
+      loop: "{{ omada_devices_resp.json.result.data }}"
       loop_control:
-        label: "{{ item.name | default('?') }}"
+        label: "{{ item.name }}"
+
+    # ---- Firmware probe: fetch each device's DETAIL record ----
+    - name: Get per-device DETAIL (where needUpgrade likely lives)
+      ansible.builtin.uri:
+        url: "{{ omada_base_url }}/openapi/v1/{{ omada_id }}/sites/{{ omada_site_id }}/devices/{{ item.mac }}"
+        method: GET
+        headers:
+          Authorization: "AccessToken={{ omada_token }}"
+        validate_certs: "{{ omada_validate_certs }}"
+        timeout: 20
+        return_content: true
+      register: omada_dev_detail
+      failed_when: false          # discovery: never hard-fail, we want to SEE the response
+      loop: "{{ omada_devices_resp.json.result.data }}"
+      lo
