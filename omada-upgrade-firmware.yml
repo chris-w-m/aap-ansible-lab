@@ -1,0 +1,147 @@
+---
+# Omada Open API — CAPSTONE: staged, monitored firmware upgrade of ONE AP.
+# Endpoint: POST /openapi/v1/{omada_id}/sites/{site_id}/devices/{mac}/start-online-upgrade
+#
+# Safe-by-design:
+#   * Upgrades ONLY if the controller reports a newer version (idempotency gate)
+#   * Operates on ONE AP per run (staged rollout)
+#   * Triggers the upgrade, then WAITS for the AP to reboot and confirms it
+#     comes back on the new firmware before reporting success.
+#
+# !! This REBOOTS the target AP — a few minutes of Wi-Fi downtime on THAT AP.
+#    Other APs are unaffected. Attach the "Omada - Shadybank (write)" credential.
+- name: Omada — upgrade firmware on one AP (staged, monitored)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    omada_validate_certs: false
+    omada_site_name: "Shadybank"
+    target_ap_name: "HallwayAP"     # ONE AP per run; set to "Kitchen AP" for the 2nd
+
+  tasks:
+    - name: Preflight — a WRITE credential must be attached
+      ansible.builtin.assert:
+        that:
+          - omada_base_url is defined
+          - omada_client_secret is defined
+        fail_msg: "Attach the 'Omada - Shadybank (write)' credential to this Job Template."
+
+    - name: Authenticate
+      ansible.builtin.uri:
+        url: "{{ omada_base_url }}/openapi/authorize/token?grant_type=client_credentials"
+        method: POST
+        body_format: json
+        body:
+          omadacId: "{{ omada_id }}"
+          client_id: "{{ omada_client_id }}"
+          client_secret: "{{ omada_client_secret }}"
+        validate_certs: "{{ omada_validate_certs }}"
+        timeout: 20
+      register: tok
+
+    - name: Verify authentication
+      ansible.builtin.assert:
+        that: tok.json.errorCode == 0
+        fail_msg: "Auth failed: {{ tok.json.msg | default('') }}"
+
+    - name: Save the access token
+      ansible.builtin.set_fact:
+        omada_token: "{{ tok.json.result.accessToken }}"
+
+    - name: Resolve the site id
+      ansible.builtin.uri:
+        url: "{{ omada_base_url }}/openapi/v1/{{ omada_id }}/sites?page=1&pageSize=100"
+        method: GET
+        headers:
+          Authorization: "AccessToken={{ omada_token }}"
+        validate_certs: "{{ omada_validate_certs }}"
+        timeout: 20
+      register: sites
+
+    - name: Set the site id
+      ansible.builtin.set_fact:
+        omada_site_id: "{{ sites.json.result.data | selectattr('name', 'equalto', omada_site_name) | map(attribute='siteId') | first }}"
+
+    - name: List devices
+      ansible.builtin.uri:
+        url: "{{ omada_base_url }}/openapi/v1/{{ omada_id }}/sites/{{ omada_site_id }}/devices?page=1&pageSize=100"
+        method: GET
+        headers:
+          Authorization: "AccessToken={{ omada_token }}"
+        validate_certs: "{{ omada_validate_certs }}"
+        timeout: 20
+      register: devs
+
+    - name: Select the target AP
+      ansible.builtin.set_fact:
+        target: "{{ devs.json.result.data | selectattr('name', 'equalto', target_ap_name) | first }}"
+
+    - name: Safety — the AP exists and is connected
+      ansible.builtin.assert:
+        that:
+          - target is defined
+          - (target.status | int) == 1
+        fail_msg: "{{ target_ap_name }} not found or not connected (status != 1) — aborting."
+
+    - name: Check available firmware for the target
+      ansible.builtin.uri:
+        url: "{{ omada_base_url }}/openapi/v1/{{ omada_id }}/sites/{{ omada_site_id }}/devices/{{ target.mac }}/latest-firmware-info"
+        method: GET
+        headers:
+          Authorization: "AccessToken={{ omada_token }}"
+        validate_certs: "{{ omada_validate_certs }}"
+        timeout: 20
+      register: fw
+
+    - name: Record current and available versions
+      ansible.builtin.set_fact:
+        target_cur_fw: "{{ fw.json.result.curFwVer | default('') }}"
+        target_last_fw: "{{ fw.json.result.lastFwVer | default('') }}"
+
+    - name: Idempotency gate — only upgrade if a newer version exists
+      ansible.builtin.assert:
+        that: (target_last_fw | length) > 0
+        fail_msg: "{{ target_ap_name }} is already up to date ({{ target_cur_fw }}) — nothing to do."
+        success_msg: "{{ target_ap_name }} will upgrade: {{ target_cur_fw }}  ->  {{ target_last_fw }}"
+
+    - name: "START UPGRADE on {{ target_ap_name }} ({{ target.mac }}) — this reboots the AP"
+      ansible.builtin.uri:
+        url: "{{ omada_base_url }}/openapi/v1/{{ omada_id }}/sites/{{ omada_site_id }}/devices/{{ target.mac }}/start-online-upgrade"
+        method: POST
+        headers:
+          Authorization: "AccessToken={{ omada_token }}"
+        validate_certs: "{{ omada_validate_certs }}"
+        timeout: 30
+      register: up
+      changed_when: up.json.errorCode == 0
+
+    - name: Confirm the upgrade was accepted
+      ansible.builtin.assert:
+        that: up.json.errorCode == 0
+        fail_msg: "start-online-upgrade failed — errorCode={{ up.json.errorCode }}: {{ up.json.msg | default('') }}"
+        success_msg: "Upgrade accepted — {{ target_ap_name }} is downloading firmware and will reboot."
+
+    - name: Wait for {{ target_ap_name }} to return on {{ target_last_fw }} (up to ~15 min)
+      ansible.builtin.uri:
+        url: "{{ omada_base_url }}/openapi/v1/{{ omada_id }}/sites/{{ omada_site_id }}/devices/{{ target.mac }}/latest-firmware-info"
+        method: GET
+        headers:
+          Authorization: "AccessToken={{ omada_token }}"
+        validate_certs: "{{ omada_validate_certs }}"
+        timeout: 20
+      register: verify
+      failed_when: false
+      retries: 45
+      delay: 20
+      until: >-
+        (verify.json is defined) and
+        ((verify.json.errorCode | default(-1)) == 0) and
+        ((verify.json.result.curFwVer | default('')) == target_last_fw)
+
+    - name: Final result
+      ansible.builtin.assert:
+        that: (verify.json.result.curFwVer | default('')) == target_last_fw
+        fail_msg: "{{ target_ap_name }} did not reach {{ target_last_fw }} within the wait window — check the controller's One-Time Upgrade page."
+        success_msg: "DONE — {{ target_ap_name }} is now running {{ target_last_fw }}."
