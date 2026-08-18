@@ -18,7 +18,7 @@
   vars:
     omada_validate_certs: false
     omada_site_name: "Shadybank"
-    target_ap_name: "HallwayAP"     # ONE AP per run; set to "Kitchen AP" for the 2nd
+    target_ap_name: "Kitchen AP"     # ONE AP per run; set to "Kitchen AP" for the 2nd
 
   tasks:
     - name: Preflight — a WRITE credential must be attached
