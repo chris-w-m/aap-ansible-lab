@@ -1,0 +1,116 @@
+---
+# Omada Open API — WRITE TEST: flash an AP's LEDs (locate) on, then off.
+# Harmless + reversible. Proves the WRITE credential (AAP-Write / Admin) works
+# before we attempt firmware upgrades.
+# Attach the "Omada - Shadybank (write)" credential to this Job Template.
+- name: Omada — locate (LED flash) write test
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    omada_validate_certs: false
+    omada_site_name: "Shadybank"
+    target_ap_name: "HallwayAP"     # which AP's LEDs to flash — change if you like
+
+  tasks:
+    - name: Preflight — ensure a WRITE credential is attached
+      ansible.builtin.assert:
+        that:
+          - omada_base_url is defined
+          - omada_id is defined
+          - omada_client_id is defined
+          - omada_client_secret is defined
+        fail_msg: "Attach the 'Omada - Shadybank (write)' credential to this Job Template."
+
+    - name: Get an access token
+      ansible.builtin.uri:
+        url: "{{ omada_base_url }}/openapi/authorize/token?grant_type=client_credentials"
+        method: POST
+        body_format: json
+        body:
+          omadacId: "{{ omada_id }}"
+          client_id: "{{ omada_client_id }}"
+          client_secret: "{{ omada_client_secret }}"
+        validate_certs: "{{ omada_validate_certs }}"
+        timeout: 20
+      register: tok
+
+    - name: Verify authentication
+      ansible.builtin.assert:
+        that: tok.json.errorCode == 0
+        fail_msg: "Auth failed: {{ tok.json.msg | default('') }}"
+
+    - name: Save the access token
+      ansible.builtin.set_fact:
+        omada_token: "{{ tok.json.result.accessToken }}"
+
+    - name: Resolve the site id
+      ansible.builtin.uri:
+        url: "{{ omada_base_url }}/openapi/v1/{{ omada_id }}/sites?page=1&pageSize=100"
+        method: GET
+        headers:
+          Authorization: "AccessToken={{ omada_token }}"
+        validate_certs: "{{ omada_validate_certs }}"
+        timeout: 20
+      register: sites
+
+    - name: Set the site id
+      ansible.builtin.set_fact:
+        omada_site_id: "{{ sites.json.result.data | selectattr('name', 'equalto', omada_site_name) | map(attribute='siteId') | first }}"
+
+    - name: Look up the target AP's MAC
+      ansible.builtin.uri:
+        url: "{{ omada_base_url }}/openapi/v1/{{ omada_id }}/sites/{{ omada_site_id }}/devices?page=1&pageSize=100"
+        method: GET
+        headers:
+          Authorization: "AccessToken={{ omada_token }}"
+        validate_certs: "{{ omada_validate_certs }}"
+        timeout: 20
+      register: devs
+
+    - name: Set the target MAC
+      ansible.builtin.set_fact:
+        target_mac: "{{ devs.json.result.data | selectattr('name', 'equalto', target_ap_name) | map(attribute='mac') | first }}"
+
+    - name: Turn ON locate — LEDs start flashing on {{ target_ap_name }}
+      ansible.builtin.uri:
+        url: "{{ omada_base_url }}/openapi/v1/{{ omada_id }}/sites/{{ omada_site_id }}/devices/{{ target_mac }}/locate"
+        method: POST
+        body_format: json
+        body:
+          locateEnable: true
+        headers:
+          Authorization: "AccessToken={{ omada_token }}"
+        validate_certs: "{{ omada_validate_certs }}"
+        timeout: 20
+      register: loc_on
+
+    - name: Confirm the WRITE call succeeded (proves Admin write access)
+      ansible.builtin.assert:
+        that: loc_on.json.errorCode == 0
+        fail_msg: "Locate ON failed — errorCode={{ loc_on.json.errorCode }}: {{ loc_on.json.msg | default('') }} (does the write app have Admin rights?)"
+        success_msg: "WRITE OK — {{ target_ap_name }} ({{ target_mac }}) LEDs should be flashing now."
+
+    - name: Let the LEDs flash for 15 seconds so you can see it
+      ansible.builtin.pause:
+        seconds: 15
+
+    - name: Turn OFF locate — back to normal
+      ansible.builtin.uri:
+        url: "{{ omada_base_url }}/openapi/v1/{{ omada_id }}/sites/{{ omada_site_id }}/devices/{{ target_mac }}/locate"
+        method: POST
+        body_format: json
+        body:
+          locateEnable: false
+        headers:
+          Authorization: "AccessToken={{ omada_token }}"
+        validate_certs: "{{ omada_validate_certs }}"
+        timeout: 20
+      register: loc_off
+
+    - name: Confirm locate turned off
+      ansible.builtin.assert:
+        that: loc_off.json.errorCode == 0
+        fail_msg: "Locate OFF failed: {{ loc_off.json.msg | default('') }}"
+        success_msg: "{{ target_ap_name }} locate turned off — write test complete."
