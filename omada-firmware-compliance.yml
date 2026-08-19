@@ -1,0 +1,125 @@
+---
+# Omada Open API — FIRMWARE COMPLIANCE CHECK (read-only).
+# Use the READ (Viewer) credential — a scheduled, unattended job should have the
+# minimum rights to do its work, and this one only looks.
+#
+# Reports every AP as COMPLIANT or OUT-OF-DATE and, by default, FAILS the job if
+# any device is behind — so a scheduled run turns red (and can fire a
+# notification) the moment the fleet drifts out of compliance.
+- name: Omada — firmware compliance check
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    omada_validate_certs: false
+    omada_site_name: "Shadybank"
+    fail_on_drift: true          # set false for report-only (never fails)
+
+  tasks:
+    - name: Preflight — ensure the Omada credential is attached
+      ansible.builtin.assert:
+        that:
+          - omada_base_url is defined
+          - omada_client_secret is defined
+        fail_msg: "Attach the 'Omada - Shadybank' (read) credential to this Job Template."
+
+    - name: Authenticate
+      ansible.builtin.uri:
+        url: "{{ omada_base_url }}/openapi/authorize/token?grant_type=client_credentials"
+        method: POST
+        body_format: json
+        body:
+          omadacId: "{{ omada_id }}"
+          client_id: "{{ omada_client_id }}"
+          client_secret: "{{ omada_client_secret }}"
+        validate_certs: "{{ omada_validate_certs }}"
+        timeout: 20
+      register: tok
+
+    - name: Verify authentication
+      ansible.builtin.assert:
+        that: tok.json.errorCode == 0
+        fail_msg: "Auth failed: {{ tok.json.msg | default('') }}"
+
+    - name: Save the access token
+      ansible.builtin.set_fact:
+        omada_token: "{{ tok.json.result.accessToken }}"
+
+    - name: Resolve the site id
+      ansible.builtin.uri:
+        url: "{{ omada_base_url }}/openapi/v1/{{ omada_id }}/sites?page=1&pageSize=100"
+        method: GET
+        headers:
+          Authorization: "AccessToken={{ omada_token }}"
+        validate_certs: "{{ omada_validate_certs }}"
+        timeout: 20
+      register: sites
+
+    - name: Set the site id
+      ansible.builtin.set_fact:
+        omada_site_id: "{{ sites.json.result.data | selectattr('name', 'equalto', omada_site_name) | map(attribute='siteId') | first }}"
+
+    - name: List devices
+      ansible.builtin.uri:
+        url: "{{ omada_base_url }}/openapi/v1/{{ omada_id }}/sites/{{ omada_site_id }}/devices?page=1&pageSize=100"
+        method: GET
+        headers:
+          Authorization: "AccessToken={{ omada_token }}"
+        validate_certs: "{{ omada_validate_certs }}"
+        timeout: 20
+      register: omada_devices_resp
+
+    - name: Get latest firmware info per device
+      ansible.builtin.uri:
+        url: "{{ omada_base_url }}/openapi/v1/{{ omada_id }}/sites/{{ omada_site_id }}/devices/{{ item.mac }}/latest-firmware-info"
+        method: GET
+        headers:
+          Authorization: "AccessToken={{ omada_token }}"
+        validate_certs: "{{ omada_validate_certs }}"
+        timeout: 20
+      register: omada_fw
+      failed_when: false
+      loop: "{{ omada_devices_resp.json.result.data }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Build the compliance report
+      ansible.builtin.set_fact:
+        report: >-
+          {{ report | default([]) + [ {
+               'name': item.item.name,
+               'model': item.item.model,
+               'current': item.item.firmwareVersion,
+               'available': (item.json.result.lastFwVer | default('')),
+               'compliant': ((item.json.result.lastFwVer | default('')) | length) == 0
+             } ] }}
+      loop: "{{ omada_fw.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    - name: Per-AP compliance status
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.name }} ({{ item.model }}): {{ 'COMPLIANT' if item.compliant else 'OUT-OF-DATE' }}
+          | current={{ item.current }}{{ '  ->  available=' + item.available if not item.compliant else '' }}
+      loop: "{{ report }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Identify any out-of-date devices
+      ansible.builtin.set_fact:
+        drift: "{{ report | rejectattr('compliant') | map(attribute='name') | list }}"
+
+    - name: Compliance summary
+      ansible.builtin.debug:
+        msg: >-
+          Fleet: {{ report | length }} APs | compliant: {{ report | selectattr('compliant') | list | length }}
+          | OUT-OF-DATE: {{ drift | length }} {{ drift }}
+
+    - name: Enforce compliance — fail the job if any AP is behind
+      ansible.builtin.assert:
+        that: (drift | length) == 0
+        fail_msg: "NON-COMPLIANT: {{ drift | length }} AP(s) behind on firmware: {{ drift | join(', ') }}"
+        success_msg: "All {{ report | length }} APs are on the latest firmware."
+      when: fail_on_drift | bool
